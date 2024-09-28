@@ -1,0 +1,346 @@
+diff --git a/mlir/lib/Target/Cpp/TranslateToCpp.cpp b/mlir/lib/Target/Cpp/TranslateToCpp.cpp
+index 4645ca4b206e..052ff69a92bc 100644
+--- a/mlir/lib/Target/Cpp/TranslateToCpp.cpp
++++ b/mlir/lib/Target/Cpp/TranslateToCpp.cpp
+@@ -24,6 +24,7 @@
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/FormatVariadic.h"
+ #include <utility>
++#include <cctype>
+ 
+ #define DEBUG_TYPE "translate-to-cpp"
+ 
+@@ -227,7 +228,11 @@ static LogicalResult printOperation(CppEmitter &emitter,
+   Operation *operation = variableOp.getOperation();
+   Attribute value = variableOp.getValue();
+ 
+-  return printConstantOp(emitter, operation, value);
++  if (operation->hasAttr("doFold")) {
++    return success();
++  } else {
++    return printConstantOp(emitter, operation, value);
++  }
+ }
+ 
+ static LogicalResult printOperation(CppEmitter &emitter,
+@@ -417,9 +422,261 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::CallOp callOp) {
+   raw_ostream &os = emitter.ostream();
+   Operation &op = *callOp.getOperation();
+ 
+-  if (failed(emitter.emitAssignPrefix(op)))
+-    return failure();
+-  os << callOp.getCallee();
++  // struct_write has a result type, make sure not to emit that.
++  if (callOp.getCallee() != "__ep2_intrin_struct_write") {
++    if (failed(emitter.emitAssignPrefix(op)))
++      return failure();
++  }
++
++  // Supports folding, currently unused.
++  auto isFolded = [&](mlir::Value v) {
++    llvm::StringRef name = emitter.getOrCreateName(v);
++    return name[0] != 'v';
++  };
++
++  auto getTableName = [&](mlir::Value table) {
++    llvm::StringRef tblName = cast<emitc::OpaqueAttr>(dyn_cast<emitc::VariableOp>(table.getDefiningOp()).getValue()).getValue();
++    return tblName.str().substr(1);
++  };
++
++  // More documentation on intrinsics is in LowerEmitcPass.cpp, where we emit these.
++  if (callOp.getCallee() == "__ep2_intrin_struct_access") {
++    // args[2] tells whether we are reading out a reference type.
++    os << ((*callOp.getArgs()).size() > 1 && (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue() ? "&" : "");
++
++    os << emitter.getOrCreateName(op.getOperand(0));
++    if (isFolded(op.getOperand(0))) {
++      os << ".";
++    } else {
++      os << "->";
++    }
++    if (isa<IntegerAttr>((*callOp.getArgs())[0])) {
++      os << "f" << (*callOp.getArgs())[0].cast<IntegerAttr>().getValue();
++    } else {
++      os << (*callOp.getArgs())[0].cast<StringAttr>().getValue();
++    }
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_struct_write") {
++    os << emitter.getOrCreateName(op.getOperand(1));
++    if (isFolded(op.getOperand(1))) {
++      os << ".";
++    } else {
++      os << "->";
++    }
++    if (isa<IntegerAttr>((*callOp.getArgs())[0])) {
++      os << "f" << (*callOp.getArgs())[0].cast<IntegerAttr>().getValue();
++    } else {
++      os << (*callOp.getArgs())[0].cast<StringAttr>().getValue();
++    }
++    // args[2] similarly tells whether writing in a reference type.
++    os << " = ";
++    os << ((*callOp.getArgs()).size() > 1 && (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue() ? "*" : "");
++    os << emitter.getOrCreateName(op.getOperand(0));
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_ctx_write") {
++    os << emitter.getOrCreateName(op.getOperand(1)) << "->";
++    if (isa<IntegerAttr>((*callOp.getArgs())[0])) {
++      os << "f" << (*callOp.getArgs())[0].cast<IntegerAttr>().getValue();
++    } else {
++      os << (*callOp.getArgs())[0].cast<StringAttr>().getValue();
++    }
++    os << " = ";
++    // support an embedded struct access.
++    if ((*callOp.getArgs()).size() >= 3 && (*callOp.getArgs())[2].cast<IntegerAttr>().getValue().getSExtValue()) {
++      os << emitter.getOrCreateName(op.getOperand(0)) << "->";
++      os << "f" << (*callOp.getArgs())[0].cast<IntegerAttr>().getValue();
++    } else {
++      os << ((*callOp.getArgs()).size() > 1 && (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue() ? "*" : "");
++      os << emitter.getOrCreateName(op.getOperand(0));
++    }
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_incr_ptr") {
++    os << emitter.getOrCreateName(op.getOperand(0)) << " += ";
++    os << (*callOp.getArgs())[0].cast<IntegerAttr>().getValue();
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_ctx_read") {
++    os << ((*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue() ? "&" : "");
++    os << emitter.getOrCreateName(op.getOperand(0)) << "->";
++    if (isa<IntegerAttr>((*callOp.getArgs())[0])) {
++      os << "f" << (*callOp.getArgs())[0].cast<IntegerAttr>().getValue();
++    } else {
++      os << (*callOp.getArgs())[0].cast<StringAttr>().getValue();
++    }
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_pkt_size_set") {
++    // TODO should choose between f0.offs vs f0.sz, depending on zero-copy buffer
++    os << "next_work_NET_SEND.meta.len = next_work_NET_SEND.f0.sz";
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_table_lookup") {
++    if ((*callOp.getArgs())[0].cast<IntegerAttr>().getValue().getSExtValue()) {
++      os << "*" << emitter.getOrCreateName(op.getOperand(2)) << " = ";
++    }
++    os << emitter.getOrCreateName(op.getOperand(0)) << "->table[";
++
++    std::string tblName = getTableName(op.getOperand(0));
++    int sz = (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue();
++    auto key = emitter.getOrCreateName(op.getOperand(1));
++    if (sz <= 16) {
++      os << "me_cam_lookup(" << key << ")]";
++    } else {
++      os << "lmem_cam_lookup(" << tblName << "_index, " << key << ", " << sz << ")]";
++    }
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_table_update") {
++    std::string tblName = getTableName(op.getOperand(0));
++    int sz = (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue();
++    auto key = emitter.getOrCreateName(op.getOperand(1));
++
++    os << emitter.getOrCreateName(op.getOperand(0)) << "->table[";
++    if (sz <= 16) {
++      os << "me_cam_update(" << key << ")]";
++    } else {
++      os << "lmem_cam_update(" << tblName << "_index, " << key << ", " << sz << ")]";
++    }
++    os << " = ";
++    os << ((*callOp.getArgs())[0].cast<IntegerAttr>().getValue().getSExtValue() ? "*" : "");
++    os << emitter.getOrCreateName(op.getOperand(2));
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_ternary") {
++    os << "(" << emitter.getOrCreateName(op.getOperand(0)) << " ? ";
++    os << emitter.getOrCreateName(op.getOperand(1)) << " : ";
++    os << emitter.getOrCreateName(op.getOperand(2)) << ")";
++    return success();
++  } else if (callOp.getCallee().starts_with("__ep2_intrin_memcpy_") || 
++             callOp.getCallee().starts_with("__ep2_intrin_memcpybuf_")) {
++    /* If memcpybuf, we need to emit location e.g. v6.buf + v6.offs, whereas if 
++       not a buf-based copy, then just the pointer, e.g. v6 */
++    bool notBufCopy = callOp.getCallee().starts_with("__ep2_intrin_memcpy_");
++
++    // Extract real name (20/23 are length of __ep2_intrin_memcpy_/..buf_
++    llvm::StringRef realCallee = callOp.getCallee().substr(notBufCopy ? 20 : 23);
++    os << realCallee << "(";
++    int xferOffset = (*callOp.getArgs())[0].cast<IntegerAttr>().getValue().getSExtValue();
++    int tag = (*callOp.getArgs())[2].cast<IntegerAttr>().getValue().getSExtValue();
++
++    if (xferOffset >= 0) {
++      // a pointer arithmetic
++      os << emitter.getOrCreateName(op.getOperand(0)) << ".buf + ";
++      if (tag == 2) {
++        os << emitter.getOrCreateName(op.getOperand(0)) << ".offs, ";
++      } else {
++        os << xferOffset << ", ";
++      }
++    } else {
++      // encode a member-based offset, e.g. &v9->f2
++      xferOffset = ~xferOffset;
++      os << "&" << emitter.getOrCreateName(op.getOperand(0)) << "->f" << xferOffset << ", ";
++    }
++
++    if (notBufCopy) {
++      os << "&" << emitter.getOrCreateName(op.getOperand(1)) << "->f" << xferOffset << ", ";
++    } else {
++      os << emitter.getOrCreateName(op.getOperand(1)) << ".buf + ";
++      os << emitter.getOrCreateName(op.getOperand(1)) << ".offs, ";
++    }
++
++    int sz = (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue();
++    // tag == 2 means buffer-based copy
++    if (tag != 2) {
++      os << sz;
++    } else {
++      // buffer based copy
++      os << emitter.getOrCreateName(op.getOperand(1)) << ".sz - " << emitter.getOrCreateName(op.getOperand(1)) << ".offs";
++    }
++    os << ")";
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_deq_work") {
++    auto event = (*callOp.getArgs())[0].cast<StringAttr>().getValue();
++    auto queueId = (*callOp.getArgs())[1].cast<StringAttr>().getValue();
++
++    os << "cls_workq_add_thread(WORKQ_ID_" << event;
++    if (queueId != "") {
++      os << "_" << queueId;
++    }
++    os << ", " << emitter.getOrCreateName(op.getOperand(0)) << ", ";
++    os << "sizeof(*" << emitter.getOrCreateName(op.getOperand(0)) << "))";
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_enq_work") {
++    auto event = (*callOp.getArgs())[0].cast<StringAttr>().getValue();
++    std::string queueList = (*callOp.getArgs())[1].cast<StringAttr>().getValue().str();
++    llvm::SmallVector<int> queues;
++    
++    auto parseDescription = [&](std::string info) {
++      unsigned p = 0;
++      while (p < info.size()) {
++        int v = 0;
++        while (p < info.size() && isdigit(info[p])) {
++          v *= 10;
++          v += (info[p] - '0');
++          p += 1;
++        }
++        queues.push_back(v);
++        while (p < info.size() && !isdigit(info[p])) {
++          p += 1;
++        }
++      }
++    };
++    parseDescription(queueList);
++
++    if (queues.size() <= 1) {
++      os << "cls_workq_add_work(WORKQ_ID_" << event;
++      if (queues.size() == 0) {
++        // TODO handle extern replication
++      } else {
++        os << "_" << queues[0];
++      }
++      os << ", " << emitter.getOrCreateName(op.getOperand(0)) << ", ";
++      os << "sizeof(*" << emitter.getOrCreateName(op.getOperand(0)) << "))";
++    } else {
++      os << callOp->getAttr("func").cast<mlir::StringAttr>().getValue().str() << "()";
++    }
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_xfer2gpr") {
++    // Move data from transfer (xfer) register to gpr (general purpose register)
++    if (isFolded(op.getOperand(1))) {
++      os << emitter.getOrCreateName(op.getOperand(1));
++    } else {
++      os << "*(" << emitter.getOrCreateName(op.getOperand(1)) << ")";
++    }
++    os << " = *(" << emitter.getOrCreateName(op.getOperand(0)) << ")";
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_gpr2xfer") {
++    os << "*(" << emitter.getOrCreateName(op.getOperand(1)) << ") = ";
++    if (isFolded(op.getOperand(0))) {
++      os << emitter.getOrCreateName(op.getOperand(0));
++    } else {
++      os << "*(" << emitter.getOrCreateName(op.getOperand(0)) << ")";
++    }
++    return success();
++  } else if (callOp.getCallee() == "__ep2_intrin_incr_offs") {
++    /*
++    If we use zero-copy optimization, we set the offset prior to memcpy from/to buffer,
++      as an abuse of the intrinsic.
++    If not, we use offset field to actually track position in buffer.
++    setVal == -1 means we are NOT setting the value, e.g. no zero copy.
++    */
++    int sz = (*callOp.getArgs())[1].cast<IntegerAttr>().getValue().getSExtValue();
++    int tag = (*callOp.getArgs())[0].cast<IntegerAttr>().getValue().getSExtValue();
++    int setVal = (*callOp.getArgs())[2].cast<IntegerAttr>().getValue().getSExtValue();
++
++    os << emitter.getOrCreateName(op.getOperand(0)) << ".offs ";
++    if (setVal == -1) {
++      os << "+";
++    }
++    os << "= ";
++    if (setVal == -1) {
++      if (tag != 2) {
++        os << sz;
++      } else {
++        os << emitter.getOrCreateName(op.getOperand(1)) << ".sz - " << emitter.getOrCreateName(op.getOperand(1)) << ".offs";
++      }
++    } else {
++      os << setVal;
++    }
++    return success();
++  } else {
++    os << callOp.getCallee();
++  }
+ 
+   auto emitArgs = [&](Attribute attr) -> LogicalResult {
+     if (auto t = dyn_cast<IntegerAttr>(attr)) {
+@@ -451,10 +708,15 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::CallOp callOp) {
+ 
+   os << "(";
+ 
+-  LogicalResult emittedArgs =
+-      callOp.getArgs()
+-          ? interleaveCommaWithError(*callOp.getArgs(), os, emitArgs)
+-          : emitter.emitOperands(op);
++  if (callOp.getArgs()) {
++    if (failed(
++            interleaveCommaWithError(*callOp.getArgs(), os, emitArgs)))
++      return failure();
++    if (op.getNumOperands() != 0)
++      os << ", ";
++  }
++
++  LogicalResult emittedArgs = emitter.emitOperands(op);
+   if (failed(emittedArgs))
+     return failure();
+   os << ")";
+@@ -772,6 +1034,13 @@ CppEmitter::CppEmitter(raw_ostream &os, bool declareVariablesAtTop)
+ StringRef CppEmitter::getOrCreateName(Value val) {
+   if (auto literal = dyn_cast_if_present<emitc::LiteralOp>(val.getDefiningOp()))
+     return literal.getValue();
++  if (auto var = dyn_cast_if_present<emitc::VariableOp>(val.getDefiningOp()) &&
++      val.getDefiningOp()->hasAttr("doFold")) {
++    auto name = cast<emitc::OpaqueAttr>(cast<emitc::VariableOp>(val.getDefiningOp()).getValue()).getValue();
++    assert(name[0] == '&');
++    return name.substr(1);
++  }
++
+   if (!valueMapper.count(val))
+     valueMapper.insert(val, formatv("v{0}", ++valueInScopeCount.top()));
+   return *valueMapper.begin(val);
+@@ -787,7 +1056,7 @@ StringRef CppEmitter::getOrCreateName(Block &block) {
+ bool CppEmitter::shouldMapToUnsigned(IntegerType::SignednessSemantics val) {
+   switch (val) {
+   case IntegerType::Signless:
+-    return false;
++    return true;
+   case IntegerType::Signed:
+     return false;
+   case IntegerType::Unsigned:
+@@ -1046,10 +1315,11 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
+   if (auto iType = dyn_cast<IntegerType>(type)) {
+     switch (iType.getWidth()) {
+     case 1:
+-      return (os << "bool"), success();
++      return (os << "char"), success();
+     case 8:
+     case 16:
+     case 32:
++    case 48:
+     case 64:
+       if (shouldMapToUnsigned(iType.getSignedness()))
+         return (os << "uint" << iType.getWidth() << "_t"), success();

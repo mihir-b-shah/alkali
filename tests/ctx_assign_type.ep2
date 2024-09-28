@@ -1,0 +1,25 @@
+event A {
+    atom at;
+    context ctx;
+}
+
+event B {
+    atom at;
+    context ctx;
+}
+
+handler A:a (context ctx) {
+    bits<48> t1;
+    buf t2;
+    ctx.t1 = t1;
+    ctx.t2 = t2;
+    generate B{ctx};
+}
+
+
+handler B:b (context ctx) {
+    bits<48> t1;
+    buf out;
+    t1 = ctx.t1;
+    out.emit(ctx.t2);
+}
